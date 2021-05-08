@@ -1,0 +1,6 @@
+bctls-jdk15on-1.68.jar
+bctls-jdk15on-1.68-sources.jar
+/.gradle/
+/.idea/
+/build/
+/out/

@@ -1,0 +1,18 @@
+plugins {
+    id 'java'
+}
+
+group 'org.example'
+version '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation group: 'io.netty', name: 'netty-all', version: '4.1.63.Final'
+
+    implementation group: 'org.bouncycastle', name: 'bcprov-jdk15on', version: '1.68'
+    implementation group: 'org.bouncycastle', name: 'bcpkix-jdk15on', version: '1.68'
+    implementation files('bctls-jdk15on-1.68.jar') // without BouncyCastle's signature
+}
