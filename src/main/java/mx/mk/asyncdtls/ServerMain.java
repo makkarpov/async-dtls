@@ -92,7 +92,7 @@ public class ServerMain {
         BcTlsCrypto crypto = new BcTlsCrypto(SecureRandom.getInstance("SHA1PRNG"));
         TlsServer server = new TlsServer(crypto, cert.certificate, cert.privateKey);
 
-        boolean classic = false;
+        boolean classic = true;
 
         if (classic) {
             DatagramSocket socket = new DatagramSocket(33333);
