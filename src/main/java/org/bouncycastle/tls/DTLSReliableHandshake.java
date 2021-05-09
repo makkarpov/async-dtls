@@ -91,29 +91,62 @@ class DTLSReliableHandshake
      * No 'final' modifiers so that it works in earlier JDKs
      */
     private DTLSRecordLayer recordLayer;
-    private Timeout handshakeTimeout;
+    private TlsTimer.TaskHandle handshakeTimeout;
 
     private TlsHandshakeHash handshakeHash;
 
     private Hashtable currentInboundFlight = new Hashtable();
     private Hashtable previousInboundFlight = null;
+    private Vector resendOutboundFlight = new Vector();
     private Vector outboundFlight = new Vector();
 
     private int resendMillis = -1;
-    private Timeout resendTimeout = null;
+    private TlsTimer.TaskHandle resendTimeout = null;
+    private Runnable resendRunnable;
 
     private int next_send_seq = 0, next_receive_seq = 0;
+    private boolean finished;
 
     DTLSReliableHandshake(TlsContext context, DTLSRecordLayer transport, int timeoutMillis, DTLSRequest request)
     {
         this.recordLayer = transport;
         this.handshakeHash = new DeferredHash(context);
-        this.handshakeTimeout = Timeout.forWaitMillis(timeoutMillis);
+
+        if (timeoutMillis > 0) {
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    transport.getTransport().exceptionCaught(new TlsTimeoutException("Handshake timed out"));
+                }
+            };
+
+            handshakeTimeout = transport.getTimer().schedule(r, timeoutMillis);
+        }
+
+        resendRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (resendTimeout == null) {
+                    // Safety measure against buggy timers, otherwise it can severely screw up state machine.
+                    return;
+                }
+
+                resendTimeout = null;
+
+                try {
+                    if (!recordLayer.isClosed()) {
+                        resendOutboundFlight();
+                    }
+                } catch (IOException e) {
+                    recordLayer.getTransport().exceptionCaught(e);
+                }
+            }
+        };
 
         if (null != request)
         {
             resendMillis = INITIAL_RESEND_MILLIS;
-            resendTimeout = new Timeout(resendMillis);
+            scheduleResend();
 
             long recordSeq = request.getRecordSeq();
             int messageSeq = request.getMessageSeq();
@@ -140,7 +173,7 @@ class DTLSReliableHandshake
         outboundFlight = new Vector();
 
         resendMillis = -1;
-        resendTimeout = null;
+        cancelResend();
 
         // We're waiting for ServerHello, always with (message) sequence number 1
         next_receive_seq = 1;
@@ -160,20 +193,14 @@ class DTLSReliableHandshake
         return result;
     }
 
+    void startFlight() {
+        outboundFlight.clear();
+    }
+
     void sendMessage(short msg_type, byte[] body)
         throws IOException
     {
         TlsUtils.checkUint24(body.length);
-
-        if (null != resendTimeout)
-        {
-            checkInboundFlight();
-
-            resendMillis = -1;
-            resendTimeout = null;
-
-            outboundFlight.removeAllElements();
-        }
 
         Message message = new Message(next_send_seq++, msg_type, body);
 
@@ -183,31 +210,29 @@ class DTLSReliableHandshake
         updateHandshakeMessagesDigest(message);
     }
 
-    byte[] receiveMessageBody(short msg_type)
-        throws IOException
-    {
-        Message message = receiveMessage();
-        if (message.getType() != msg_type)
-        {
-            throw new TlsFatalAlert(AlertDescription.unexpected_message);
+    void finishFlight() throws IOException {
+        if (outboundFlight.size() != 0) {
+            resendMillis = INITIAL_RESEND_MILLIS;
+            resendOutboundFlight.clear();
+
+            for (int i = 0; i < outboundFlight.size(); i++) {
+                resendOutboundFlight.add(outboundFlight.elementAt(i));
+            }
         }
 
-        return message.getBody();
+        if (finished) {
+            cancelResend();
+        } else if (outboundFlight.size() != 0) {
+            scheduleResend();
+        }
+
+        prepareInboundFlight(new Hashtable());
+        recordLayer.getTransport().flush(false);
     }
 
     Message receiveMessage()
         throws IOException
     {
-        long currentTimeMillis = System.currentTimeMillis();
-
-        if (null == resendTimeout)
-        {
-            resendMillis = INITIAL_RESEND_MILLIS;
-            resendTimeout = new Timeout(resendMillis, currentTimeMillis);
-
-            prepareInboundFlight(new Hashtable());
-        }
-
         byte[] buf = null;
 
         for (;;)
@@ -223,44 +248,28 @@ class DTLSReliableHandshake
                 return pending;
             }
 
-            if (Timeout.hasExpired(handshakeTimeout, currentTimeMillis))
-            {
-                throw new TlsTimeoutException("Handshake timed out");
-            }
-
-            int waitMillis = Timeout.getWaitMillis(handshakeTimeout, currentTimeMillis);
-            waitMillis = Timeout.constrainWaitMillis(waitMillis, resendTimeout, currentTimeMillis);
-
-            // NOTE: Ensure a finite wait, of at least 1ms
-            if (waitMillis < 1)
-            {
-                waitMillis = 1;
-            }
-
             int receiveLimit = recordLayer.getReceiveLimit();
             if (buf == null || buf.length < receiveLimit)
             {
                 buf = new byte[receiveLimit];
             }
 
-            int received = recordLayer.receive(buf, 0, receiveLimit, waitMillis);
+            int received = recordLayer.receive(buf, 0, receiveLimit);
             if (received < 0)
             {
-                resendOutboundFlight();
-            }
-            else
-            {
-                processRecord(MAX_RECEIVE_AHEAD, recordLayer.getReadEpoch(), buf, 0, received);
+                return null;
             }
 
-            currentTimeMillis = System.currentTimeMillis();
+            processRecord(MAX_RECEIVE_AHEAD, recordLayer.getReadEpoch(), buf, 0, received);
         }
     }
 
-    void finish()
+    void finish(boolean installRetransmit)
     {
+        finished = true;
+
         DTLSHandshakeRetransmit retransmit = null;
-        if (null != resendTimeout)
+        if (!installRetransmit)
         {
             checkInboundFlight();
         }
@@ -281,13 +290,18 @@ class DTLSReliableHandshake
                     public void receivedHandshakeRecord(int epoch, byte[] buf, int off, int len)
                         throws IOException
                     {
-                        processRecord(0, epoch, buf, off, len);
+                        doResendOutboundFlight();
                     }
                 };
             }
         }
 
         recordLayer.handshakeSuccessful(retransmit);
+    }
+
+    void close() throws IOException {
+        cancelResend();
+        recordLayer.close();
     }
 
     static int backOff(int timeoutMillis)
@@ -302,7 +316,7 @@ class DTLSReliableHandshake
     /**
      * Check that there are no "extra" messages left in the current inbound flight
      */
-    private void checkInboundFlight()
+    void checkInboundFlight()
     {
         Enumeration e = currentInboundFlight.keys();
         while (e.hasMoreElements())
@@ -332,7 +346,10 @@ class DTLSReliableHandshake
 
     private void prepareInboundFlight(Hashtable nextFlight)
     {
-        resetAll(currentInboundFlight);
+        if (currentInboundFlight != null) {
+            resetAll(currentInboundFlight);
+        }
+
         previousInboundFlight = currentInboundFlight;
         currentInboundFlight = nextFlight;
     }
@@ -414,17 +431,25 @@ class DTLSReliableHandshake
         }
     }
 
+    private void doResendOutboundFlight() throws IOException {
+        recordLayer.resetWriteEpoch();
+        for (int i = 0; i < resendOutboundFlight.size(); ++i)
+        {
+            writeMessage((Message)resendOutboundFlight.elementAt(i));
+        }
+
+        recordLayer.getTransport().flush(true);
+    }
+
     private void resendOutboundFlight()
         throws IOException
     {
-        recordLayer.resetWriteEpoch();
-        for (int i = 0; i < outboundFlight.size(); ++i)
-        {
-            writeMessage((Message)outboundFlight.elementAt(i));
-        }
+        doResendOutboundFlight();
 
-        resendMillis = backOff(resendMillis);
-        resendTimeout = new Timeout(resendMillis);
+        if (resendMillis > 0) {
+            resendMillis = backOff(resendMillis);
+            scheduleResend();
+        }
     }
 
     private Message updateHandshakeMessagesDigest(Message message)
@@ -494,6 +519,18 @@ class DTLSReliableHandshake
         fragment.write(message.getBody(), fragment_offset, fragment_length);
 
         fragment.sendToRecordLayer(recordLayer);
+    }
+
+    private void cancelResend() {
+        if (resendTimeout != null) {
+            resendTimeout.cancel();
+            resendTimeout = null;
+        }
+    }
+
+    private void scheduleResend() {
+        cancelResend();
+        resendTimeout = recordLayer.getTimer().schedule(resendRunnable, resendMillis);
     }
 
     private static boolean checkAll(Hashtable inboundFlight)

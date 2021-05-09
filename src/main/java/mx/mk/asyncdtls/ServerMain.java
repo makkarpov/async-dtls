@@ -2,56 +2,86 @@ package mx.mk.asyncdtls;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
-import io.netty.channel.*;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelInitializer;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.DatagramChannel;
-import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.HashedWheelTimer;
-import org.bouncycastle.cert.X509CertificateHolder;
-import org.bouncycastle.crypto.params.AsymmetricKeyParameter;
 import org.bouncycastle.tls.*;
-import org.bouncycastle.tls.crypto.TlsCertificate;
-import org.bouncycastle.tls.crypto.TlsCrypto;
-import org.bouncycastle.tls.crypto.TlsCryptoParameters;
-import org.bouncycastle.tls.crypto.impl.bc.BcDefaultTlsCredentialedSigner;
-import org.bouncycastle.tls.crypto.impl.bc.BcTlsCertificate;
 import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto;
 
 import java.io.IOException;
 import java.net.DatagramSocket;
-import java.net.InetSocketAddress;
 import java.net.SocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.Vector;
 
 public class ServerMain {
-    private static class DatagramPacketHandler extends ChannelDuplexHandler {
-        private InetSocketAddress endpoint;
-
+    private static class MessageEchoHandler extends ChannelInboundHandlerAdapter {
         @Override
-        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-            ctx.write(new DatagramPacket((ByteBuf) msg, endpoint), promise);
-        }
+        public void channelRead(ChannelHandlerContext ctx, Object msgData) throws Exception {
+            ByteBuf msg = (ByteBuf) msgData;
 
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            DatagramPacket packet = (DatagramPacket) msg;
-            endpoint = packet.sender();
-            ctx.fireChannelRead(packet.content());
+            byte[] data = new byte[msg.readableBytes()];
+            msg.getBytes(msg.readerIndex(), data);
+            System.out.println("recv: " + Utils.printMessage(data, data.length));
+
+            ctx.write(msg);
         }
     }
 
-    private static class TlsServer extends DefaultTlsServer {
-        private final BcTlsCrypto crypto;
-        private final X509CertificateHolder certificate;
-        private final AsymmetricKeyParameter privateKey;
+    private static class DatagramServerTransport implements DatagramTransport {
+        private final DatagramSocket socket;
+        private final int mtu;
+        private SocketAddress endpoint;
 
-        public TlsServer(BcTlsCrypto crypto, X509CertificateHolder certificate, AsymmetricKeyParameter privateKey) {
+        public DatagramServerTransport(DatagramSocket socket, int mtu) {
+            this.socket = socket;
+            this.mtu = mtu;
+        }
+
+        @Override
+        public int getReceiveLimit() throws IOException {
+            return mtu;
+        }
+
+        @Override
+        public int receive(byte[] buf, int off, int len, int waitMillis) throws IOException {
+            socket.setSoTimeout(waitMillis);
+            java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, off, len);
+            socket.receive(packet);
+            endpoint = packet.getSocketAddress();
+            return packet.getLength();
+        }
+
+        @Override
+        public int getSendLimit() throws IOException {
+            return mtu;
+        }
+
+        @Override
+        public void send(byte[] buf, int off, int len) throws IOException {
+            java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, off, len, endpoint);
+            socket.send(packet);
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+        }
+    }
+
+    private static class TlsServer extends AbstractTlsServer {
+        private final BcTlsCrypto crypto;
+        private final Utils.CertificateResult certificate;
+
+        public TlsServer(BcTlsCrypto crypto, Utils.CertificateResult certificate) {
             super(crypto);
             this.crypto = crypto;
             this.certificate = certificate;
-            this.privateKey = privateKey;
         }
 
         @Override
@@ -71,74 +101,57 @@ public class ServerMain {
         }
 
         @Override
-        protected TlsCredentialedSigner getECDSASignerCredentials() throws IOException {
-            return new BcDefaultTlsCredentialedSigner(
-                    new TlsCryptoParameters(context),
-                    crypto,
-                    privateKey,
-                    new Certificate(new TlsCertificate[]{
-                            new BcTlsCertificate(crypto, certificate.getEncoded())
-                    }),
-                    new SignatureAndHashAlgorithm(HashAlgorithm.sha256, SignatureAlgorithm.ecdsa)
+        public TlsCredentials getCredentials() throws IOException {
+            return certificate.toCredentials(crypto, context);
+        }
+
+        @Override
+        public CertificateRequest getCertificateRequest() throws IOException {
+            Vector supportedSignatures = TlsUtils.getDefaultSupportedSignatureAlgorithms(context);
+            Vector certificateAuthorities = new Vector();
+
+            return new CertificateRequest(
+                    new short[] {
+                            ClientCertificateType.rsa_sign,
+                            ClientCertificateType.ecdsa_sign
+                    },
+                    supportedSignatures, certificateAuthorities
             );
+        }
+
+        @Override
+        public void notifyClientCertificate(Certificate clientCertificate) throws IOException {
         }
     }
 
     public static void main(String[] args) throws Exception {
-        NioEventLoopGroup group = new NioEventLoopGroup();
-        HashedWheelTimer timer = new HashedWheelTimer();
-
-        CertificateUtils.CertificateResult cert = CertificateUtils.generateCertificate();
+        Utils.CertificateResult cert = Utils.generateCertificate();
+        System.out.println("Local certificate fingerprint: " + cert.fingerprint());
         BcTlsCrypto crypto = new BcTlsCrypto(SecureRandom.getInstance("SHA1PRNG"));
-        TlsServer server = new TlsServer(crypto, cert.certificate, cert.privateKey);
+        TlsServer server = new TlsServer(crypto, cert);
 
-        boolean classic = true;
+        boolean classic = args.length != 0 && args[0].equalsIgnoreCase("classic");
 
         if (classic) {
+            System.out.println("Running in classic (blocking) mode");
+
             DatagramSocket socket = new DatagramSocket(33333);
-            int limit = 1432;
-            DatagramTransport socketTransport = new DatagramTransport() {
-                SocketAddress endpoint;
+            DatagramTransport socketTransport = new DatagramServerTransport(socket, Utils.MTU);
 
-                @Override
-                public int getReceiveLimit() throws IOException {
-                    return limit;
-                }
+            DTLSTransport transport = new DTLSServerProtocol().accept(server, socketTransport);
+            Utils.printContext(transport.getContext());
 
-                @Override
-                public int receive(byte[] buf, int off, int len, int waitMillis) throws IOException {
-                    socket.setSoTimeout(waitMillis);
-                    java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, off, len);
-                    socket.receive(packet);
-                    endpoint = packet.getSocketAddress();
-                    return packet.getLength();
-                }
-
-                @Override
-                public int getSendLimit() throws IOException {
-                    return limit;
-                }
-
-                @Override
-                public void send(byte[] buf, int off, int len) throws IOException {
-                    java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, off, len, endpoint);
-                    socket.send(packet);
-                }
-
-                @Override
-                public void close() throws IOException {
-                    socket.close();
-                }
-            };
-
-            DTLSServerProtocol protocol = new DTLSServerProtocol();
-            DatagramTransport transport = protocol.accept(server, socketTransport);
             while (true) {
-                byte[] buf = new byte[limit];
-                int r = transport.receive(buf, 0, limit, 0);
-                System.out.println(r + ":" + new String(buf, 0, r, StandardCharsets.UTF_8));
+                byte[] buf = new byte[Utils.MTU];
+                int r = transport.receive(buf, 0, buf.length, 0);
+                System.out.println("recv: " + Utils.printMessage(buf, r));
+                transport.send(buf, 0, r);
             }
         } else {
+            System.out.println("Running in async mode");
+
+            NioEventLoopGroup group = new NioEventLoopGroup();
+            HashedWheelTimer timer = new HashedWheelTimer();
             Channel ch = new Bootstrap()
                     .group(group)
                     .channel(NioDatagramChannel.class)
@@ -146,8 +159,11 @@ public class ServerMain {
                         @Override
                         protected void initChannel(DatagramChannel ch) throws Exception {
                             ch.pipeline()
-                                    .addLast(new DatagramPacketHandler())
-                                    .addLast(new DTLSServerHandler(server, timer));
+                                .addLast(new DatagramPacketHandler())
+                                .addLast(PacketLossSimulator.INSTANCE)
+                                .addLast(new DTLSProtocolHandler(timer,
+                                        (tr, tim) -> new DTLSServerProtocol().async(server, tim, tr)))
+                                .addLast(new MessageEchoHandler());
                         }
                     })
                     .bind(33333)

@@ -12,13 +12,14 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.SocketTimeoutException;
 
-class DTLSRecordLayer
-    implements DatagramTransport
-{
+/**
+ * This class is *not* thread-safe. For explanations, see {@link DTLSAsyncProtocol}.
+ */
+class DTLSRecordLayer implements TlsCloseable {
     private static final int RECORD_HEADER_LENGTH = 13;
     private static final int MAX_FRAGMENT_LENGTH = 1 << 14;
-    private static final long TCP_MSL = 1000L * 60 * 2;
-    private static final long RETRANSMIT_TIMEOUT = TCP_MSL * 2;
+    private static final int TCP_MSL = 1000 * 60 * 2;
+    private static final int RETRANSMIT_TIMEOUT = TCP_MSL * 2;
 
     static byte[] receiveClientHelloRecord(byte[] data, int dataOff, int dataLen) throws IOException
     {
@@ -94,37 +95,41 @@ class DTLSRecordLayer
 
     private final TlsContext context;
     private final TlsPeer peer;
-    private final DatagramTransport transport;
+    private final TlsTimer timer;
+    private final DTLSAsyncTransport transport;
 
     private final ByteQueue recordQueue = new ByteQueue();
-    private final Object writeLock = new Object();
 
-    private volatile boolean closed = false;
-    private volatile boolean failed = false;
+    private boolean closed = false;
+    private boolean failed = false;
     // TODO[dtls13] Review the draft/RFC (legacy_record_version) to see if readVersion can be removed
-    private volatile ProtocolVersion readVersion = null, writeVersion = null;
-    private volatile boolean inConnection;
-    private volatile boolean inHandshake;
-    private volatile int plaintextLimit;
+    private ProtocolVersion readVersion = null, writeVersion = null;
+    private boolean inConnection;
+    private boolean inHandshake;
+    private int plaintextLimit;
     private DTLSEpoch currentEpoch, pendingEpoch;
     private DTLSEpoch readEpoch, writeEpoch;
 
     private DTLSHandshakeRetransmit retransmit = null;
     private DTLSEpoch retransmitEpoch = null;
-    private Timeout retransmitTimeout = null;
+    private final Runnable retransmitRunnable;
+    private TlsTimer.TaskHandle retransmitTimeout = null;
 
-    private TlsHeartbeat heartbeat = null;              // If non-null, controls the sending of heartbeat requests
-    private boolean heartBeatResponder = false;         // Whether we should send heartbeat responses
+    private TlsHeartbeat heartbeat = null;                      // If non-null, controls the sending of heartbeat requests
+    private boolean heartBeatResponder = false;                 // Whether we should send heartbeat responses
 
-    private HeartbeatMessage heartbeatInFlight = null;  // The current in-flight heartbeat request, if any
-    private Timeout heartbeatTimeout = null;            // Idle timeout (if none in-flight), else expiry timeout for response
+    private HeartbeatMessage heartbeatInFlight = null;          // The current in-flight heartbeat request, if any
+    private final Runnable heartbeatRunnable;
+    private TlsTimer.TaskHandle heartbeatTimeout = null;        // Idle timeout (if none in-flight), else expiry timeout for response
 
-    private int heartbeatResendMillis = -1;             // Delay before retransmit of current in-flight heartbeat request
-    private Timeout heartbeatResendTimeout = null;      // Timeout for next retransmit of the in-flight heartbeat request
+    private int heartbeatResendMillis = -1;                     // Delay before retransmit of current in-flight heartbeat request
+    private final Runnable heartbeatResendRunnable;
+    private TlsTimer.TaskHandle heartbeatResendTimeout = null;  // Timeout for next retransmit of the in-flight heartbeat request
 
-    DTLSRecordLayer(TlsContext context, TlsPeer peer, DatagramTransport transport)
+    DTLSRecordLayer(TlsContext context, TlsTimer timer, TlsPeer peer, DTLSAsyncTransport transport)
     {
         this.context = context;
+        this.timer = timer;
         this.peer = peer;
         this.transport = transport;
 
@@ -136,6 +141,45 @@ class DTLSRecordLayer
         this.writeEpoch = currentEpoch;
 
         setPlaintextLimit(MAX_FRAGMENT_LENGTH);
+
+        retransmitRunnable = new Runnable() {
+            @Override
+            public void run() {
+                retransmit = null;
+                retransmitEpoch = null;
+                retransmitTimeout = null;
+            }
+        };
+
+        heartbeatRunnable = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    heartbeatTimeout();
+                } catch (IOException e) {
+                    transport.exceptionCaught(e);
+                }
+            }
+        };
+
+        heartbeatResendRunnable = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    heartbeatResendTimeout();
+                } catch (IOException e) {
+                    transport.exceptionCaught(e);
+                }
+            }
+        };
+    }
+
+    TlsTimer getTimer() {
+        return timer;
+    }
+
+    DTLSAsyncTransport getTransport() {
+        return transport;
     }
 
     boolean isClosed()
@@ -205,7 +249,7 @@ class DTLSRecordLayer
         {
             this.retransmit = retransmit;
             this.retransmitEpoch = currentEpoch;
-            this.retransmitTimeout = new Timeout(RETRANSMIT_TIMEOUT);
+            this.retransmitTimeout = schedule(retransmitTimeout, retransmitRunnable, RETRANSMIT_TIMEOUT);
         }
 
         this.inHandshake = false;
@@ -227,6 +271,29 @@ class DTLSRecordLayer
         {
             resetHeartbeat();
         }
+    }
+
+    private void heartbeatTimeout() throws IOException {
+        if (null != heartbeatInFlight)
+        {
+            throw new TlsTimeoutException("Heartbeat timed out");
+        }
+
+        this.heartbeatInFlight = HeartbeatMessage.create(context, HeartbeatMessageType.heartbeat_request,
+                heartbeat.generatePayload());
+        this.heartbeatTimeout = schedule(heartbeatTimeout, heartbeatRunnable, heartbeat.getTimeoutMillis());
+
+        this.heartbeatResendMillis = DTLSReliableHandshake.INITIAL_RESEND_MILLIS;
+        this.heartbeatResendTimeout = schedule(heartbeatResendTimeout, heartbeatResendRunnable, heartbeatResendMillis);
+
+        sendHeartbeatMessage(heartbeatInFlight);
+    }
+
+    private void heartbeatResendTimeout() throws IOException {
+        this.heartbeatResendMillis = DTLSReliableHandshake.backOff(heartbeatResendMillis);
+        this.heartbeatResendTimeout = schedule(heartbeatResendTimeout, heartbeatResendRunnable, heartbeatResendMillis);
+
+        sendHeartbeatMessage(heartbeatInFlight);
     }
 
     void resetWriteEpoch()
@@ -255,74 +322,41 @@ class DTLSRecordLayer
             writeEpoch.getCipher().getPlaintextLimit(transport.getSendLimit() - RECORD_HEADER_LENGTH));
     }
 
-    public int receive(byte[] buf, int off, int len, int waitMillis)
+    // Fills up receive buffer
+    public void pushReceivedDatagram(byte[] buf, int off, int len) {
+        // RFC 6347, 4.1.1: Records may not span datagrams.
+        // Also single malformed datagram can corrupt whole queue, since we never check actual length vs length field
+        // So flush queue on each packet
+
+        recordQueue.removeData(recordQueue.available());
+        recordQueue.shrink();
+        recordQueue.addData(buf, off, len);
+    }
+
+    // Returns -1 when reaching end of queue
+    public int receive(byte[] buf, int off, int len)
         throws IOException
     {
-        long currentTimeMillis = System.currentTimeMillis();
-
-        Timeout timeout = Timeout.forWaitMillis(waitMillis, currentTimeMillis);
         byte[] record = null;
 
-        while (waitMillis >= 0)
-        {
-            if (null != retransmitTimeout && retransmitTimeout.remainingMillis(currentTimeMillis) < 1)
-            {
-                retransmit = null;
-                retransmitEpoch = null;
-                retransmitTimeout = null;
-            }
-
-            if (Timeout.hasExpired(heartbeatTimeout, currentTimeMillis))
-            {
-                if (null != heartbeatInFlight)
-                {
-                    throw new TlsTimeoutException("Heartbeat timed out");
-                }
-
-                this.heartbeatInFlight = HeartbeatMessage.create(context, HeartbeatMessageType.heartbeat_request,
-                    heartbeat.generatePayload());
-                this.heartbeatTimeout = new Timeout(heartbeat.getTimeoutMillis(), currentTimeMillis);
-
-                this.heartbeatResendMillis = DTLSReliableHandshake.INITIAL_RESEND_MILLIS;
-                this.heartbeatResendTimeout = new Timeout(heartbeatResendMillis, currentTimeMillis);
-
-                sendHeartbeatMessage(heartbeatInFlight);
-            }
-            else if (Timeout.hasExpired(heartbeatResendTimeout, currentTimeMillis))
-            {
-                this.heartbeatResendMillis = DTLSReliableHandshake.backOff(heartbeatResendMillis);
-                this.heartbeatResendTimeout = new Timeout(heartbeatResendMillis, currentTimeMillis);
-
-                sendHeartbeatMessage(heartbeatInFlight);
-            }
-
-            waitMillis = Timeout.constrainWaitMillis(waitMillis, heartbeatTimeout, currentTimeMillis);
-            waitMillis = Timeout.constrainWaitMillis(waitMillis, heartbeatResendTimeout, currentTimeMillis);
-
-            // NOTE: Guard against bad logic giving a negative value 
-            if (waitMillis < 0)
-            {
-                waitMillis = 1;
-            }
-
+        while (true) {
             int receiveLimit = Math.min(len, getReceiveLimit()) + RECORD_HEADER_LENGTH;
             if (null == record || record.length < receiveLimit)
             {
                 record = new byte[receiveLimit];
             }
 
-            int received = receiveRecord(record, 0, receiveLimit, waitMillis);
+            int received = receiveRecord(record, len);
+            if (received < 0) {
+                return -1;
+            }
+
             int processed = processRecord(received, record, buf, off);
             if (processed >= 0)
             {
                 return processed;
             }
-
-            currentTimeMillis = System.currentTimeMillis();
-            waitMillis = Timeout.getWaitMillis(timeout, currentTimeMillis);
         }
-
-        return -1;
     }
 
     public void send(byte[] buf, int off, int len)
@@ -375,6 +409,7 @@ class DTLSRecordLayer
             {
                 warn(AlertDescription.user_canceled, "User canceled handshake");
             }
+
             closeTransport();
         }
     }
@@ -441,6 +476,10 @@ class DTLSRecordLayer
                 // Ignore
             }
 
+            retransmitTimeout = schedule(retransmitTimeout, null, 0);
+            heartbeatResendTimeout = schedule(heartbeatResendTimeout, null, 0);
+            heartbeatTimeout = schedule(heartbeatTimeout, null, 0);
+
             closed = true;
         }
     }
@@ -455,24 +494,6 @@ class DTLSRecordLayer
         error[1] = (byte)alertDescription;
 
         sendRecord(ContentType.alert, error, 0, 2);
-    }
-
-    private int receiveDatagram(byte[] buf, int off, int len, int waitMillis)
-        throws IOException
-    {
-        try
-        {
-            return transport.receive(buf, off, len, waitMillis);
-        }
-        catch (SocketTimeoutException e)
-        {
-            return -1;
-        }
-        catch (InterruptedIOException e)
-        {
-            e.bytesTransferred = 0;
-            throw e;
-        }
     }
 
     // TODO Include 'currentTimeMillis' as an argument, use with Timeout, resetHeartbeat
@@ -725,16 +746,27 @@ class DTLSRecordLayer
         {
             this.retransmit = null;
             this.retransmitEpoch = null;
-            this.retransmitTimeout = null;
+            this.retransmitTimeout = schedule(retransmitTimeout, null, 0);
         }
 
         System.arraycopy(decoded.buf, decoded.off, buf, off, decoded.len);
         return decoded.len;
     }
 
-    private int receiveRecord(byte[] buf, int off, int len, int waitMillis)
+    public int nextRecordLength() {
+        if (recordQueue.available() >= RECORD_HEADER_LENGTH) {
+            byte[] lengthBytes = new byte[2];
+            recordQueue.read(lengthBytes, 0, 2, 11);
+            return Math.min(recordQueue.available(), RECORD_HEADER_LENGTH + TlsUtils.readUint16(lengthBytes, 0));
+        }
+
+        return -1;
+    }
+
+    private int receiveRecord(byte[] buf, int len)
         throws IOException
     {
+        // TODO: 'len' is completely ignored here, which may produce ArrayIndexOutOfBounds exceptions
         if (recordQueue.available() > 0)
         {
             int length = 0;
@@ -746,25 +778,11 @@ class DTLSRecordLayer
             }
 
             int received = Math.min(recordQueue.available(), RECORD_HEADER_LENGTH + length);
-            recordQueue.removeData(buf, off, received, 0);
+            recordQueue.removeData(buf, 0, received, 0);
             return received;
         }
 
-        int received = receiveDatagram(buf, off, len, waitMillis);
-        if (received >= RECORD_HEADER_LENGTH)
-        {
-            this.inConnection = true;
-
-            int fragmentLength = TlsUtils.readUint16(buf, off + 11);
-            int recordLength = RECORD_HEADER_LENGTH + fragmentLength;
-            if (received > recordLength)
-            {
-                recordQueue.addData(buf, off + recordLength, received - recordLength);
-                received = recordLength;
-            }
-        }
-
-        return received;
+        return -1;
     }
 
     private void resetHeartbeat()
@@ -772,7 +790,7 @@ class DTLSRecordLayer
         this.heartbeatInFlight = null;
         this.heartbeatResendMillis = -1;
         this.heartbeatResendTimeout = null;
-        this.heartbeatTimeout = new Timeout(heartbeat.getIdleMillis());
+        this.heartbeatTimeout = schedule(heartbeatTimeout, heartbeatRunnable, heartbeat.getIdleMillis());
     }
 
     private void sendHeartbeatMessage(HeartbeatMessage heartbeatMessage)
@@ -783,6 +801,7 @@ class DTLSRecordLayer
         byte[] buf = output.toByteArray();
 
         sendRecord(ContentType.heartbeat, buf, 0, buf.length);
+        transport.flush(false);
     }
 
     /*
@@ -813,26 +832,39 @@ class DTLSRecordLayer
             throw new TlsFatalAlert(AlertDescription.internal_error);
         }
 
-        synchronized (writeLock)
-        {
-            int recordEpoch = writeEpoch.getEpoch();
-            long recordSequenceNumber = writeEpoch.allocateSequenceNumber();
-            long macSequenceNumber = getMacSequenceNumber(recordEpoch, recordSequenceNumber);
-            ProtocolVersion recordVersion = writeVersion;
+        int recordEpoch = writeEpoch.getEpoch();
+        long recordSequenceNumber = writeEpoch.allocateSequenceNumber();
+        long macSequenceNumber = getMacSequenceNumber(recordEpoch, recordSequenceNumber);
+        ProtocolVersion recordVersion = writeVersion;
 
-            TlsEncodeResult encoded = writeEpoch.getCipher().encodePlaintext(macSequenceNumber, contentType,
-                recordVersion, RECORD_HEADER_LENGTH, buf, off, len);
+        TlsEncodeResult encoded = writeEpoch.getCipher().encodePlaintext(macSequenceNumber, contentType,
+            recordVersion, RECORD_HEADER_LENGTH, buf, off, len);
 
-            int ciphertextLength = encoded.len - RECORD_HEADER_LENGTH;
-            TlsUtils.checkUint16(ciphertextLength);
+        int ciphertextLength = encoded.len - RECORD_HEADER_LENGTH;
+        TlsUtils.checkUint16(ciphertextLength);
 
-            TlsUtils.writeUint8(encoded.recordType, encoded.buf, encoded.off + 0);
-            TlsUtils.writeVersion(recordVersion, encoded.buf, encoded.off + 1);
-            TlsUtils.writeUint16(recordEpoch, encoded.buf, encoded.off + 3);
-            TlsUtils.writeUint48(recordSequenceNumber, encoded.buf, encoded.off + 5);
-            TlsUtils.writeUint16(ciphertextLength, encoded.buf, encoded.off + 11);
+        TlsUtils.writeUint8(encoded.recordType, encoded.buf, encoded.off + 0);
+        TlsUtils.writeVersion(recordVersion, encoded.buf, encoded.off + 1);
+        TlsUtils.writeUint16(recordEpoch, encoded.buf, encoded.off + 3);
+        TlsUtils.writeUint48(recordSequenceNumber, encoded.buf, encoded.off + 5);
+        TlsUtils.writeUint16(ciphertextLength, encoded.buf, encoded.off + 11);
 
-            sendDatagram(transport, encoded.buf, encoded.off, encoded.len);
+        sendDatagram(transport, encoded.buf, encoded.off, encoded.len);
+    }
+
+    private TlsTimer.TaskHandle schedule(TlsTimer.TaskHandle old, Runnable target, int millis) {
+        if (old != null) {
+            old.cancel();
+        }
+
+        if (target != null && (closed || failed)) {
+            throw new IllegalStateException("Scheduling timer when transport is closed");
+        }
+
+        if (target != null) {
+            return timer.schedule(target, millis);
+        } else {
+            return null; // useful for cancellation
         }
     }
 
