@@ -1,9 +1,13 @@
 plugins {
     id 'java'
+    id 'maven-publish'
 }
 
-group 'org.example'
-version '1.0-SNAPSHOT'
+group 'org.bouncycastle'
+version '1.67'
+
+compileJava.sourceCompatibility = '1.8'
+compileJava.targetCompatibility = '1.8'
 
 repositories {
     mavenCentral()
@@ -15,4 +19,27 @@ dependencies {
     implementation group: 'org.bouncycastle', name: 'bcprov-jdk15on', version: '1.68'
     implementation group: 'org.bouncycastle', name: 'bcpkix-jdk15on', version: '1.68'
 //    implementation files('bctls-jdk15on-1.68.jar') // without BouncyCastle's signature
+}
+
+jar {
+    exclude 'mx/**'
+}
+
+publishing {
+    repositories {
+        maven {
+            url = 'https://maven.m-k.mx/'
+
+            credentials {
+                username = System.env.MAVEN_USERNAME
+                password = System.env.MAVEN_PASSWORD
+            }
+        }
+    }
+
+    publications {
+        maven(MavenPublication) {
+            from components.java
+        }
+    }
 }
